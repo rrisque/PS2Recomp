@@ -7,6 +7,7 @@
 #include "runtime/ps2_address.h"
 
 #include <fmt/format.h>
+#include <regex>
 
 namespace ps2recomp
 {
@@ -122,6 +123,31 @@ namespace ps2recomp
 
     std::string InstructionTranslator::translate(const Instruction &inst, const MemoryAccessHint &memoryHint)
     {
+        // Runtime-linked instruction (XFF import resolved from a data package at run time): the
+        // immediate in the ELF is stale, so read it back from the instruction word in guest memory.
+        if (m_codeGenerator.isDynamicSite(inst.address) && !m_inDynamicSite &&
+            inst.opcode != OPCODE_J && inst.opcode != OPCODE_JAL)
+        {
+            Instruction patched = inst;
+            constexpr int32_t kSimmSentinel = -29999;
+            constexpr uint32_t kImmSentinel = 47111u;
+            patched.simmediate = kSimmSentinel;
+            patched.immediate = kImmSentinel;
+            m_inDynamicSite = true;
+            std::string code = translate(patched, {});
+            m_inDynamicSite = false;
+            const std::string word = fmt::format("READ32(0x{:X}u)", inst.address);
+            code = std::regex_replace(code, std::regex("(^|[^0-9A-Za-z_])(-29999|4294937297)(?![0-9])"),
+                                      "$1((int32_t)(int16_t)(" + word + " & 0xFFFFu))");
+            code = std::regex_replace(code, std::regex("(^|[^0-9A-Za-z_])47111(?![0-9])"),
+                                      "$1((uint32_t)(" + word + " & 0xFFFFu))");
+            if (code.find("29999") != std::string::npos || code.find("47111") != std::string::npos || code.find("4294937297") != std::string::npos)
+            {
+                throw std::runtime_error(fmt::format("dynamic site 0x{:X}: sentinel survived substitution: {}", inst.address, code));
+            }
+            return code + " /* dynamic-link site */";
+        }
+
         if (inst.isMMI)
         {
             return m_codeGenerator.translateMMIInstruction(inst);
@@ -139,6 +165,31 @@ namespace ps2recomp
             return translateMemoryWrite(inst, effectiveMemoryHint, width, addr, val);
         };
 
+        // Accesses that ignore the low address bits (LQ/SQ/LQC2/SQC2 drop bits 3..0; the
+        // LWL/LWR/LDL/LDR/SWL/SWR/SDL/SDR pairs touch the aligned word/doubleword). A statically
+        // resolved hint is the *effective* address, so it has to be aligned the same way.
+        auto alignedHint = [&](uint32_t alignMask)
+        {
+            MemoryAccessHint hint = effectiveMemoryHint;
+            if (hint.hasAddress)
+            {
+                hint.address &= ~alignMask;
+            }
+            return hint;
+        };
+        auto genReadAligned = [&](int width, const std::string &addr, uint32_t alignMask)
+        {
+            return translateMemoryRead(inst, alignedHint(alignMask), width, addr);
+        };
+        auto genWriteAligned = [&](int width, const std::string &addr, const std::string &val, uint32_t alignMask)
+        {
+            return translateMemoryWrite(inst, alignedHint(alignMask), width, addr, val);
+        };
+        auto quadAddr = [&]()
+        {
+            return fmt::format("(ADD32(GPR_U32(ctx, {}), {}) & ~0xFu)", inst.rs, inst.simmediate);
+        };
+
         switch (inst.opcode)
         {
         case OPCODE_SPECIAL:
@@ -152,8 +203,7 @@ namespace ps2recomp
         case OPCODE_COP2:
             return m_codeGenerator.translateVUInstruction(inst);
         case OPCODE_ADDI:
-            if (inst.rt == 0)
-                return "// NOP (addi to $zero)";
+            // No $zero shortcut: the overflow exception is raised even when the result is discarded.
             return fmt::format(
                 "{{ uint32_t tmp; bool ov; "
                 "ADD32_OV(GPR_U32(ctx, {}), (int32_t){}, tmp, ov); "
@@ -196,9 +246,10 @@ namespace ps2recomp
         case OPCODE_SW:
             return genWrite(32, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), fmt::format("GPR_U32(ctx, {})", inst.rt)) + ";";
         case OPCODE_LQ:
-            return fmt::format("SET_GPR_VEC(ctx, {}, {});", inst.rt, genRead(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate)));
+            // LQ/SQ ignore the low 4 bits of the effective address (PCSX2: memRead128(addr & ~0xf)).
+            return fmt::format("SET_GPR_VEC(ctx, {}, {});", inst.rt, genReadAligned(128, quadAddr(), 0xFu));
         case OPCODE_SQ:
-            return genWrite(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), fmt::format("GPR_VEC(ctx, {})", inst.rt)) + ";";
+            return genWriteAligned(128, quadAddr(), fmt::format("GPR_VEC(ctx, {})", inst.rt), 0xFu) + ";";
         case OPCODE_LD:
             return fmt::format("SET_GPR_U64(ctx, {}, {});", inst.rt, genRead(64, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate)));
         case OPCODE_SD:
@@ -211,21 +262,24 @@ namespace ps2recomp
                 inst.rt,
                 genWrite(32, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), "bits"));
         case OPCODE_LDC2:
-            return fmt::format("ctx->vu0_vf[{}] = _mm_castsi128_ps({});", inst.rt, genRead(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate)));
+            // LQC2: quadword access (low 4 address bits ignored); vf0 is hard-wired and never written.
+            if (inst.rt == 0)
+                return fmt::format("(void){};", genReadAligned(128, quadAddr(), 0xFu));
+            return fmt::format("ctx->vu0_vf[{}] = _mm_castsi128_ps({});", inst.rt, genReadAligned(128, quadAddr(), 0xFu));
         case OPCODE_SDC2:
-            return genWrite(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), fmt::format("_mm_castps_si128(ctx->vu0_vf[{}])", inst.rt)) + ";";
+            return genWriteAligned(128, quadAddr(), fmt::format("_mm_castps_si128(ctx->vu0_vf[{}])", inst.rt), 0xFu) + ";";
         case OPCODE_DADDI:
             return fmt::format(
-                "{{ int64_t src = (int64_t)GPR_S64(ctx, {}); "
-                "int64_t imm = (int64_t)(int32_t){}; "
-                "int64_t res = src + imm; "
-                "if (((src ^ imm) >= 0) && ((src ^ res) < 0)) "
+                "{{ uint64_t src = GPR_U64(ctx, {}); "
+                "uint64_t imm = (uint64_t)(int64_t)(int32_t){}; "
+                "uint64_t res = src + imm; "
+                "if ((~(src ^ imm) & (src ^ res)) >> 63) "
                 "    runtime->SignalException(ctx, EXCEPTION_INTEGER_OVERFLOW); "
-                "else SET_GPR_S64(ctx, {}, res); }}",
+                "else SET_GPR_U64(ctx, {}, res); }}",
                 inst.rs, inst.simmediate, inst.rt);
         case OPCODE_DADDIU:
             return fmt::format(
-                "SET_GPR_S64(ctx, {}, (int64_t)GPR_S64(ctx, {}) + (int64_t)(int32_t){});",
+                "SET_GPR_U64(ctx, {}, GPR_U64(ctx, {}) + (uint64_t)(int64_t)(int32_t){});",
                 inst.rt, inst.rs, inst.simmediate);
         case OPCODE_J:
             return fmt::format("// J 0x{:X} - Handled by branch logic", buildAbsoluteJumpTarget(inst.address, inst.target));
@@ -249,7 +303,7 @@ namespace ps2recomp
                                "uint32_t shift = (7u - offset) << 3; "
                                "uint64_t keepMask = (shift == 0) ? 0ull : ((1ull << shift) - 1ull); "
                                "SET_GPR_U64(ctx, {}, (GPR_U64(ctx, {}) & keepMask) | (mem << shift)); }}",
-                               inst.rs, inst.simmediate, genRead(64, "aligned_addr"), inst.rt, inst.rt);
+                               inst.rs, inst.simmediate, genReadAligned(64, "aligned_addr", 7u), inst.rt, inst.rt);
 
         case OPCODE_LDR:
             return fmt::format("{{ uint32_t addr = ADD32(GPR_U32(ctx, {}), {}); "
@@ -259,7 +313,7 @@ namespace ps2recomp
                                "uint32_t shift = offset << 3; "
                                "uint64_t keepMask = (offset == 0) ? 0ull : (0xFFFFFFFFFFFFFFFFull << ((8u - offset) << 3)); "
                                "SET_GPR_U64(ctx, {}, (GPR_U64(ctx, {}) & keepMask) | (mem >> shift)); }}",
-                               inst.rs, inst.simmediate, genRead(64, "aligned_addr"), inst.rt, inst.rt);
+                               inst.rs, inst.simmediate, genReadAligned(64, "aligned_addr", 7u), inst.rt, inst.rt);
 
         case OPCODE_LWL:
             return fmt::format("{{ uint32_t addr = ADD32(GPR_U32(ctx, {}), {}); "
@@ -270,7 +324,7 @@ namespace ps2recomp
                                "uint32_t keepMask = (shift == 0) ? 0u : ((1u << shift) - 1u); "
                                "uint32_t merged = (GPR_U32(ctx, {}) & keepMask) | (mem << shift); "
                                "SET_GPR_S32(ctx, {}, (int32_t)merged); }}",
-                               inst.rs, inst.simmediate, genRead(32, "aligned_addr"), inst.rt, inst.rt);
+                               inst.rs, inst.simmediate, genReadAligned(32, "aligned_addr", 3u), inst.rt, inst.rt);
 
         case OPCODE_LWR:
             return fmt::format("{{ uint32_t addr = ADD32(GPR_U32(ctx, {}), {}); "
@@ -283,7 +337,7 @@ namespace ps2recomp
                                "uint64_t merged64 = (GPR_U64(ctx, {}) & 0xFFFFFFFF00000000ull) | (uint64_t)merged32; "
                                "if (offset == 0) merged64 = (uint64_t)(int64_t)(int32_t)merged32; "
                                "SET_GPR_U64(ctx, {}, merged64); }}",
-                               inst.rs, inst.simmediate, genRead(32, "aligned_addr"),
+                               inst.rs, inst.simmediate, genReadAligned(32, "aligned_addr", 3u),
                                inst.rt, inst.rt, inst.rt);
 
         case OPCODE_SWL:
@@ -296,7 +350,7 @@ namespace ps2recomp
                                "uint32_t val = GPR_U32(ctx, {}); "
                                "uint32_t new_data = (old_data & ~mask) | ((val >> shift) & mask); "
                                "{}; }}",
-                               inst.rs, inst.simmediate, genRead(32, "aligned_addr"), inst.rt, genWrite(32, "aligned_addr", "new_data"));
+                               inst.rs, inst.simmediate, genReadAligned(32, "aligned_addr", 3u), inst.rt, genWriteAligned(32, "aligned_addr", "new_data", 3u));
 
         case OPCODE_SWR:
             return fmt::format("{{ uint32_t addr = ADD32(GPR_U32(ctx, {}), {}); "
@@ -308,7 +362,7 @@ namespace ps2recomp
                                "uint32_t val = GPR_U32(ctx, {}); "
                                "uint32_t new_data = (old_data & ~mask) | ((val << shift) & mask); "
                                "{}; }}",
-                               inst.rs, inst.simmediate, genRead(32, "aligned_addr"), inst.rt, genWrite(32, "aligned_addr", "new_data"));
+                               inst.rs, inst.simmediate, genReadAligned(32, "aligned_addr", 3u), inst.rt, genWriteAligned(32, "aligned_addr", "new_data", 3u));
 
         case OPCODE_SDL:
             return fmt::format("{{ uint32_t addr = ADD32(GPR_U32(ctx, {}), {}); "
@@ -320,7 +374,7 @@ namespace ps2recomp
                                "uint64_t val = GPR_U64(ctx, {}); "
                                "uint64_t new_data = (old_data & ~mask) | ((val >> shift) & mask); "
                                "{}; }}",
-                               inst.rs, inst.simmediate, genRead(64, "aligned_addr"), inst.rt, genWrite(64, "aligned_addr", "new_data"));
+                               inst.rs, inst.simmediate, genReadAligned(64, "aligned_addr", 7u), inst.rt, genWriteAligned(64, "aligned_addr", "new_data", 7u));
 
         case OPCODE_SDR:
             return fmt::format("{{ uint32_t addr = ADD32(GPR_U32(ctx, {}), {}); "
@@ -332,7 +386,7 @@ namespace ps2recomp
                                "uint64_t val = GPR_U64(ctx, {}); "
                                "uint64_t new_data = (old_data & ~mask) | ((val << shift) & mask); "
                                "{}; }}",
-                               inst.rs, inst.simmediate, genRead(64, "aligned_addr"), inst.rt, genWrite(64, "aligned_addr", "new_data"));
+                               inst.rs, inst.simmediate, genReadAligned(64, "aligned_addr", 7u), inst.rt, genWriteAligned(64, "aligned_addr", "new_data", 7u));
         case OPCODE_CACHE:
             return "// CACHE instruction (ignored)";
         case OPCODE_PREF:

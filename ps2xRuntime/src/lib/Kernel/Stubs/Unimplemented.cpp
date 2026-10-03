@@ -43,7 +43,17 @@ namespace ps2_stubs
                   << ", $a2=0x" << getRegU32(ctx, 6)
                   << ", $a3=0x" << getRegU32(ctx, 7) << std::dec << std::endl;
 
-        //TODO maybe a macro to disable the exception and just return an success just to see it where goes.
+        // PS2X_STUB_CONTINUE=1: fail forward (return 0) so one boot surfaces every missing stub.
+        static const bool continueOnStub = [] {
+            const char *v = std::getenv("PS2X_STUB_CONTINUE");
+            return v && *v && *v != '0';
+        }();
+        if (continueOnStub)
+        {
+            std::cerr << "  -> PS2X_STUB_CONTINUE: returning 0" << std::endl;
+            setReturnS32(ctx, 0);
+            return;
+        }
         throw std::runtime_error("Unimplemented PS2 stub called: " + stubName);
     }
 }

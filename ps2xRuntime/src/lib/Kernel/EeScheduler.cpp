@@ -1,3 +1,7 @@
+#include <sstream>
+#include <iostream>
+#include <chrono>
+#include <cstdlib>
 #include "runtime/ee_scheduler.h"
 
 #include "ps2_log.h"
@@ -173,15 +177,18 @@ void EeScheduler::run()
                 copyMainContextToRuntime();
                 publishIdleDebugContext();
                 publishSnapshot();
+                dumpThreadsIfIdleTooLong();
                 waitForEvent();
                 continue;
             }
             if (next)
             {
+                dumpThreadsIfIdleTooLong();
                 makeRunning(*next);
             }
             else
             {
+                dumpThreadsIfIdleTooLong();
                 GuestThread *owner = &acquireInvocationThread();
                 GuestInvocation invocation = std::move(m_pendingInvocations.front());
                 m_pendingInvocations.pop_front();
@@ -376,8 +383,15 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
         return false;
     }
 
+    // The real EE kernel never round-robins equal-priority threads (no time slicing); a thread runs
+    // until it blocks, yields (RotateThreadReadyQueue) or a higher-priority thread becomes ready, which
+    // requestPreemptionIfHigher() already handles. PS2X_EE_TIMESLICE=0 gives hardware-faithful ordering.
+    static const bool timeSliceEqualPriority = [] {
+        const char *v = std::getenv("PS2X_EE_TIMESLICE");
+        return !(v && v[0] == '0');
+    }();
     const GuestThread *running = currentThread();
-    if (running != nullptr && hasReadyAtOrAbovePriority(running->currentPriority))
+    if (timeSliceEqualPriority && running != nullptr && hasReadyAtOrAbovePriority(running->currentPriority))
     {
         m_rescheduleRequested = true;
         m_timeSliceExpired = true;
@@ -654,6 +668,15 @@ void EeScheduler::sleepCurrent()
 int EeScheduler::wakeupThread(int id, bool interruptSafe)
 {
     assertExecutor();
+    static const bool traceWake = std::getenv("PS2X_TRACE_WAKEUP") != nullptr;
+    if (traceWake)
+    {
+        const GuestThread *t = thread(id);
+        std::cerr << "[wakeup] from=" << m_currentThreadId << " target=" << id << " isr=" << interruptSafe
+                  << " targetStatus=" << (t ? static_cast<int>(t->status) : -1)
+                  << " reason=" << (t ? static_cast<int>(t->wait.reason) : -1)
+                  << " wakeupCount=" << (t ? t->wakeupCount : 0) << std::endl;
+    }
     if (id == 0 || id == m_currentThreadId)
     {
         return KE_ILLEGAL_THID;
@@ -877,6 +900,7 @@ int EeScheduler::signalSemaphore(int id, bool interruptSafe)
         object->waiters.pop_front();
         GuestThread *waiter = thread(waiterId);
         assert(waiter != nullptr);
+        m_semaLastAcquirer[id] = {waiterId, getRegU32(&waiter->activeContext(), 31)};
         makeReady(*waiter, id, interruptSafe);
         publishSnapshot();
         return id;
@@ -903,6 +927,7 @@ int EeScheduler::pollSemaphore(int id)
         return KE_SEMA_ZERO;
     }
     --object->count;
+    if (GuestThread *self = currentThread()) m_semaLastAcquirer[id] = {self->id, getRegU32(&self->activeContext(), 31)};
     publishSnapshot();
     return id;
 }
@@ -923,6 +948,7 @@ void EeScheduler::waitSemaphore(int id)
         --object->count;
         GuestThread *self = currentThread();
         assert(self != nullptr);
+        m_semaLastAcquirer[id] = {self->id, getRegU32(&self->activeContext(), 31)};
         setReturnS32(&self->activeContext(), id);
         publishSnapshot();
         return;
@@ -1484,6 +1510,14 @@ EeKernelSnapshot EeScheduler::snapshot() const
 
 void EeScheduler::publishSnapshot()
 {
+    // Debug-UI snapshot: building it (copy + sort of every thread/sema/evf) on every syscall dominated
+    // CPU time for games that spin on semaphores. Publish at most every ~16 ms of host time.
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - m_lastSnapshotPublish < std::chrono::milliseconds(16))
+            return;
+        m_lastSnapshotPublish = now;
+    }
     EeKernelSnapshot next{};
     next.sequence = ++m_snapshotSequence;
     next.eeCycle = m_eeCycle;
@@ -1908,6 +1942,9 @@ void EeScheduler::processEvent(const EeEvent &event)
     case EeEventType::VBlankEnd:
         dispatchIrq(false, 3u);
         break;
+    case EeEventType::GsInterrupt:
+        dispatchIrq(false, 0u);
+        break;
     case EeEventType::Dmac:
         break;
     case EeEventType::Alarm:
@@ -2143,4 +2180,86 @@ void EeScheduler::publishIdleDebugContext()
     {
         publishDebugContext(selected->activeContext());
     }
+}
+
+
+void ps2xDumpDispatchProfile(std::ostream &out, size_t topN);
+void gsDumpDrawStats(std::ostream &out);
+void ps2xDumpDmaStats(std::ostream &out);
+void ps2xDumpVif1Stats(std::ostream &out);
+// PS2X_THREAD_DUMP_SECS=N: every N seconds of host time, print every guest thread's state.
+void EeScheduler::dumpThreadsIfIdleTooLong()
+{
+    static const int period = [] { const char *v = std::getenv("PS2X_THREAD_DUMP_SECS"); return v ? std::atoi(v) : 0; }();
+    if (period <= 0 || m_idleDumps >= 200)
+        return;
+    const auto now = std::chrono::steady_clock::now();
+    if (m_idleSince == std::chrono::steady_clock::time_point{}) { m_idleSince = now; return; }
+    if (now - m_idleSince < std::chrono::seconds(period))
+        return;
+    m_idleSince = now;
+    ++m_idleDumps;
+    static const char *kStatus[] = {"Running", "Ready", "Waiting", "WaitingSuspended", "Suspended", "Dormant"};
+    static const char *kReason[] = {"None", "Sleep", "Semaphore", "EventFlag", "VSync", "External", "Mpeg"};
+    std::ostringstream out;
+    ps2xDumpDispatchProfile(out, 400);
+    {
+        auto &gs = m_runtime.memory().gs();
+        out << "[ee-gs] pmode=0x" << std::hex << gs.pmode << " dispfb1=0x" << gs.dispfb1 << " display1=0x" << gs.display1
+            << " dispfb2=0x" << gs.dispfb2 << " display2=0x" << gs.display2 << " csr=0x" << gs.csr.load() << " imr=0x" << gs.imr << std::dec << "\n";
+    }
+    gsDumpDrawStats(out);
+    ps2xDumpDmaStats(out);
+    ps2xDumpVif1Stats(out);
+    out << "[ee-threads] dump #" << m_idleDumps << " current=" << m_currentThreadId << " vsync=" << m_vsyncTick << std::endl;
+    if (const char *w = std::getenv("PS2X_WATCH_WORDS"))  // comma-separated guest addresses
+    {
+        out << "[ee-watch] vsync=" << m_vsyncTick;
+        std::string list(w);
+        size_t pos = 0;
+        while (pos < list.size())
+        {
+            size_t next = list.find(',', pos);
+            const uint32_t addr = static_cast<uint32_t>(std::stoul(list.substr(pos, next - pos), nullptr, 16));
+            uint32_t v = 0;
+            if (m_rdram && addr + 4 <= PS2_RAM_SIZE) std::memcpy(&v, m_rdram + addr, 4);
+            out << " [0x" << std::hex << addr << "]=0x" << v << std::dec;
+            if (next == std::string::npos) break;
+            pos = next + 1;
+        }
+        out << std::endl;
+    }
+    for (const auto &kv : m_semaphores)
+    {
+        out << "  sema " << kv.first << " count=" << kv.second.count << "/" << kv.second.maxCount;
+        auto it = m_semaLastAcquirer.find(kv.first);
+        if (it != m_semaLastAcquirer.end()) out << " lastAcquiredBy=" << it->second.first << " ra=0x" << std::hex << it->second.second << std::dec;
+        if (!kv.second.waiters.empty()) { out << " waiters="; for (int w : kv.second.waiters) out << w << ","; }
+        out << std::endl;
+    }
+    std::vector<int> ids;
+    for (const auto &kv : m_threads) ids.push_back(kv.first);
+    std::sort(ids.begin(), ids.end());
+    for (int id : ids)
+    {
+        const GuestThread &t = m_threads.at(id);
+        out << "  thread " << id << " prio=" << t.currentPriority
+                  << " status=" << kStatus[static_cast<int>(t.status)]
+                  << " wait=" << kReason[static_cast<int>(t.wait.reason)] << std::hex;
+        if (auto *w = std::get_if<EeSemaphoreWait>(&t.wait.payload)) out << " sema=" << std::dec << w->id << std::hex;
+        if (auto *w = std::get_if<EeEventFlagWait>(&t.wait.payload)) out << " evf=" << std::dec << w->id << std::hex << " bits=0x" << w->bits;
+        if (auto *w = std::get_if<EeExternalWait>(&t.wait.payload)) out << " ext type=0x" << w->type << " token=0x" << w->token;
+        out << " entry=0x" << t.entry << " pc=0x" << t.context.pc << " ra=0x" << getRegU32(&t.context, 31)
+                  << " s0=0x" << getRegU32(&t.context, 16) << " s1=0x" << getRegU32(&t.context, 17) << " s2=0x" << getRegU32(&t.context, 18)
+                  << " sp=0x" << getRegU32(&t.context, 29) << std::dec;
+        if (t.status == EeThreadStatus::Ready)
+        {
+            int where = -1;
+            for (int q = 0; q < kPriorityCount; ++q)
+                for (int qid : m_readyQueues[q]) if (qid == id) where = q;
+            out << " inReadyQueue=" << where << " suspend=" << t.suspendCount << " invocations=" << t.invocations.size();
+        }
+        out << std::endl;
+    }
+    std::cerr << out.str() << std::flush;
 }

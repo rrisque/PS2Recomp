@@ -64,6 +64,10 @@ namespace ps2recomp
         std::unordered_map<uint32_t, Symbol> m_symbols;
         std::unordered_map<uint32_t, std::string> m_renamedFunctions;
         std::unordered_map<uint32_t, std::string> m_relocationCallNames;
+        std::unordered_set<uint32_t> m_dynamicSites; // runtime-relocated instructions: read immediate from guest memory
+        bool isDynamicSite(uint32_t addr) const { return m_dynamicSites.count(addr) != 0; }
+        std::unordered_set<uint32_t> m_hookedFunctions; // never emit direct C++ calls to these
+        bool isHookedFunction(uint32_t addr) const { return m_hookedFunctions.count(addr) != 0; }
         std::unordered_map<uint32_t, std::vector<uint32_t>> m_configJumpTableTargetsByAddress;
         std::unordered_map<uint32_t, std::vector<uint32_t>> m_resumeEntryTargetsByOwner;
         const std::vector<Section>& m_sections;

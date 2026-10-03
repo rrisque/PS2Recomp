@@ -214,6 +214,10 @@ namespace ps2recomp
             return false;
         }
 
+        if (m_gen.isHookedFunction(target))
+        {
+            return false; // keep overridable: go through runtime dispatch
+        }
         const std::string functionName = m_gen.getFunctionName(target);
         if (functionName.empty())
         {
@@ -329,6 +333,19 @@ namespace ps2recomp
 
         emitDelaySlot("    ");
 
+        if (m_gen.isDynamicSite(m_branchInst.address))
+        {
+            // Runtime-linked J/JAL: decode the target from the patched instruction in guest memory.
+            const bool isCall = kind == StaticBranchKind::Call;
+            m_ss << fmt::format("    {{ const uint32_t dynTarget = ((READ32(0x{:X}u) & 0x3FFFFFFu) << 2) | (0x{:X}u & 0xF0000000u);\n",
+                                m_branchInst.address, m_branchInst.address + 4u);
+            m_ss << "    ctx->pc = dynTarget;\n";
+            emitRuntimeBranchDispatch("dynTarget", branchPc(), isCall ? fallthroughPc() : 0u,
+                                      isCall ? "IndirectCall" : "IndirectJump", isCall ? "JAL(dyn)" : "J(dyn)", "    ", true);
+            m_ss << "    }\n";
+            return;
+        }
+
         const uint32_t target = buildAbsoluteJumpTarget(m_branchInst.address, m_branchInst.target);
         if (isInternalTarget(target))
         {
@@ -404,12 +421,14 @@ namespace ps2recomp
         case OPCODE_BNE:
         case OPCODE_BNEL:
             return fmt::format("GPR_U64(ctx, {}) != GPR_U64(ctx, {})", rsReg, rtReg);
+        // R5900 (MIPS III) compares the full 64-bit GPR against zero, like BEQ/BNE above
+        // (PCSX2 Interpreter.cpp: GPR.r[_Rs_].SD[0]).
         case OPCODE_BLEZ:
         case OPCODE_BLEZL:
-            return fmt::format("GPR_S32(ctx, {}) <= 0", rsReg);
+            return fmt::format("GPR_S64(ctx, {}) <= 0", rsReg);
         case OPCODE_BGTZ:
         case OPCODE_BGTZL:
-            return fmt::format("GPR_S32(ctx, {}) > 0", rsReg);
+            return fmt::format("GPR_S64(ctx, {}) > 0", rsReg);
         case OPCODE_REGIMM:
             switch (m_branchInst.rt)
             {
@@ -417,12 +436,12 @@ namespace ps2recomp
             case REGIMM_BLTZL:
             case REGIMM_BLTZAL:
             case REGIMM_BLTZALL:
-                return fmt::format("GPR_S32(ctx, {}) < 0", rsReg);
+                return fmt::format("GPR_S64(ctx, {}) < 0", rsReg);
             case REGIMM_BGEZ:
             case REGIMM_BGEZL:
             case REGIMM_BGEZAL:
             case REGIMM_BGEZALL:
-                return fmt::format("GPR_S32(ctx, {}) >= 0", rsReg);
+                return fmt::format("GPR_S64(ctx, {}) >= 0", rsReg);
             default:
                 return "false";
             }
@@ -464,17 +483,16 @@ namespace ps2recomp
         const bool likely = isLikelyBranch();
         const std::string branchTakenVar = fmt::format("branch_taken_0x{:x}", m_branchInst.address);
         std::string unconditionalLinkCode;
-        std::string conditionalLinkCode;
 
         if (m_branchInst.opcode == OPCODE_REGIMM)
         {
-            if (m_branchInst.rt == REGIMM_BLTZAL || m_branchInst.rt == REGIMM_BGEZAL)
+            // $ra is written whether or not the branch is taken, for the likely forms too
+            // (MIPS spec; PCSX2 BLTZALL/BGEZALL call _SetLink(31) before testing the condition).
+            // The condition is evaluated first, so `bltzal $ra, ...` still tests the old $ra.
+            if (m_branchInst.rt == REGIMM_BLTZAL || m_branchInst.rt == REGIMM_BGEZAL ||
+                m_branchInst.rt == REGIMM_BLTZALL || m_branchInst.rt == REGIMM_BGEZALL)
             {
                 unconditionalLinkCode = fmt::format("SET_GPR_U32(ctx, 31, 0x{:X}u);", fallthroughPc());
-            }
-            else if (m_branchInst.rt == REGIMM_BLTZALL || m_branchInst.rt == REGIMM_BGEZALL)
-            {
-                conditionalLinkCode = fmt::format("SET_GPR_U32(ctx, 31, 0x{:X}u);", fallthroughPc());
             }
         }
 
@@ -489,10 +507,6 @@ namespace ps2recomp
         if (likely)
         {
             m_ss << "        if (" << branchTakenVar << ") {\n";
-            if (!conditionalLinkCode.empty())
-            {
-                m_ss << "            " << conditionalLinkCode << "\n";
-            }
             emitDelaySlot("            ");
 
             if (isInternalTarget(target))
@@ -508,11 +522,6 @@ namespace ps2recomp
         }
         else
         {
-            if (!conditionalLinkCode.empty())
-            {
-                m_ss << "        if (" << branchTakenVar << ") { " << conditionalLinkCode << " }\n";
-            }
-
             emitDelaySlot("        ");
 
             m_ss << "        if (" << branchTakenVar << ") {\n";

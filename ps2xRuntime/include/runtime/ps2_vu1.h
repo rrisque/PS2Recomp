@@ -214,9 +214,13 @@ private:
     std::array<ScalarPipelineEntry, 2> m_efu{};
     std::array<PendingStore, kMaxPendingStores> m_storePipeline{};
     std::array<PendingVfWrite, kMaxPendingVfWrites> m_vfWritePipeline{};
+    uint32_t m_vfValidMask = 0u; // bit n set <=> m_vfWritePipeline[n].valid
     std::array<PendingViWrite, kMaxPendingViWrites> m_viWritePipeline{};
     std::array<PendingAccWrite, kMaxPendingAccWrites> m_accWritePipeline{};
     XgkickPipeline m_xgkick{};
+    uint64_t m_nextPipelineReady = 0; // earliest readyCycle among queued pipeline entries (0 = scan)
+    // Per-pipeline earliest readyCycle: 0 flag, 1 fdiv, 2 efu, 3 store, 4 VF, 5 VI, 6 ACC (0 = scan).
+    std::array<uint64_t, 7> m_nextReady{};
     std::array<std::array<uint64_t, 4>, 32> m_vfReady{};
     std::array<uint64_t, 16> m_viReady{};
     std::array<uint64_t, 4> m_accReady{};
@@ -278,6 +282,8 @@ private:
 
     void resetScheduler();
     void commitReadyPipelines();
+    void commitReadyPipelinesSlow();
+    void notePipelineReady(int k, uint64_t c) { if (c < m_nextReady[k]) m_nextReady[k] = c; if (c < m_nextPipelineReady) m_nextPipelineReady = c; }
     void advanceOneCycle();
     void advanceTo(uint64_t targetCycle);
     void flushPipelines();

@@ -33,7 +33,7 @@ namespace ps2recomp
             if (fs == 31)
                 return fmt::format("SET_GPR_U32(ctx, {}, ctx->fcr31);", ft); // FCR31 contains status/control
             if (fs == 0)
-                return fmt::format("SET_GPR_U32(ctx, {}, 0x00000000);", ft); // FCR0 is the FPU implementation register
+                return fmt::format("SET_GPR_U32(ctx, {}, 0x00002E00);", ft); // FCR0: implementation 0x2E, revision 0
             return fmt::format("SET_GPR_U32(ctx, {}, 0); // Unimplemented FCR{}", ft, fs);
         case COP1_CT:
             if (fs == 31)
@@ -53,12 +53,15 @@ namespace ps2recomp
             case COP1_S_MUL:
                 return fmt::format("ctx->f[{}] = FPU_MUL_S(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
             case COP1_S_DIV:
-                return fmt::format("if (ctx->f[{}] == 0.0f) {{ ctx->fcr31 |= 0x100000; /* DZ flag */ "
-                                   "ctx->f[{}] = copysignf(INFINITY, ctx->f[{}] * 0.0f); }} "
-                                   "else ctx->f[{}] = ctx->f[{}] / ctx->f[{}];",
-                                   ft, fd, fs, fd, fs, ft);
+                // PS2: x/0 = +-FLT_MAX (sign = xor of operand signs), never Inf/NaN. Divisor 0 (or denormal) sets
+                // D|SD, or I|SI for 0/0 (FCR31 bits 16/5 and 17/6).
+                return fmt::format("{{ if ((Ps2FloatBits(ctx->f[{0}]) & 0x7F800000u) == 0u) "
+                                   "ctx->fcr31 |= ((Ps2FloatBits(ctx->f[{1}]) & 0x7F800000u) == 0u) ? 0x20040u : 0x10020u; "
+                                   "ctx->f[{2}] = Ps2FDivAt(ctx->pc, ctx->f[{1}], ctx->f[{0}]); }}",
+                                   ft, fs, fd);
             case COP1_S_SQRT:
-                return fmt::format("ctx->f[{}] = FPU_SQRT_S(ctx->f[{}]);", fd, fs);
+                // sqrt.s fd, ft: the operand is in the ft field on the R5900
+                return fmt::format("ctx->f[{}] = FPU_SQRT_S(ctx->f[{}]);", fd, ft);
             case COP1_S_ABS:
                 return fmt::format("ctx->f[{}] = FPU_ABS_S(ctx->f[{}]);", fd, fs);
             case COP1_S_MOV:
@@ -76,7 +79,8 @@ namespace ps2recomp
             case COP1_S_CVT_W:
                 return fmt::format("{{ int32_t tmp = FPU_CVT_W_S(ctx->f[{}]); std::memcpy(&ctx->f[{}], &tmp, sizeof(tmp)); }}", fs, fd);
             case COP1_S_RSQRT:
-                return fmt::format("ctx->f[{}] = 1.0f / sqrtf(ctx->f[{}]);", fd, fs);
+                // rsqrt.s fd, fs, ft: fd = fs / sqrt(|ft|)
+                return fmt::format("ctx->f[{}] = FPU_RSQRT_S(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
             case COP1_S_ADDA:
                 return fmt::format("FPU_SET_ACC(ctx, FPU_ADD_S(ctx->f[{}], ctx->f[{}]));", fs, ft);
             case COP1_S_SUBA:
@@ -92,9 +96,9 @@ namespace ps2recomp
             case COP1_S_MSUBA:
                 return fmt::format("FPU_SET_ACC(ctx, FPU_SUB_S(ctx->f_acc, FPU_MUL_S(ctx->f[{}], ctx->f[{}])));", fs, ft);
             case COP1_S_MAX:
-                return fmt::format("ctx->f[{}] = std::max(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
+                return fmt::format("ctx->f[{}] = FPU_MAX_S(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
             case COP1_S_MIN:
-                return fmt::format("ctx->f[{}] = std::min(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
+                return fmt::format("ctx->f[{}] = FPU_MIN_S(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
             case COP1_S_C_F:
                 return fmt::format("ctx->fcr31 &= ~0x800000;");
             case COP1_S_C_UN:

@@ -15,6 +15,7 @@ namespace ps2recomp
     public:
         explicit InstructionTranslator(CodeGenerator &codeGenerator);
         std::string translate(const Instruction &inst, const MemoryAccessHint &memoryHint);
+        bool m_inDynamicSite = false;
 
     private:
         MemoryAccessHint effectiveMemoryHintFor(const Instruction &inst, const MemoryAccessHint &memoryHint) const;

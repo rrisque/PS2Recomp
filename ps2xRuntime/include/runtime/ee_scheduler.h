@@ -236,6 +236,7 @@ enum class EeEventType : uint8_t
     Dmac,
     ExternalWake,
     Alarm,
+    GsInterrupt, // GS CSR event (SIGNAL/FINISH) not masked by IMR -> INTC cause 0
 };
 
 struct EeEvent
@@ -394,6 +395,12 @@ private:
     void updateNextDeadline();
     [[nodiscard]] bool hasReadyAtOrAbovePriority(int priority) const;
     void renewTimeSlice();
+    void dumpThreadsIfIdleTooLong();
+    std::chrono::steady_clock::time_point m_idleSince{};
+    int m_idleDumps = 0;
+    std::unordered_map<int, std::pair<int, uint32_t>> m_semaLastAcquirer; // diag: sema -> (thread, ra)
+    std::chrono::steady_clock::time_point m_lastSnapshotPublish{};
+    int m_lastDumpCandidate = -1;
     void copyMainContextToRuntime();
     void publishDebugContext(const R5900Context &context);
     void publishIdleDebugContext();
