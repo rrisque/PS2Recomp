@@ -409,6 +409,10 @@ public:
     bool m_path3Masked = false;
     uint32_t m_vif1PendingPath2ImageQwc = 0u;
     bool m_vif1PendingPath2DirectHl = false;
+    // DIRECT/DIRECTHL payload still to arrive in the next VIF1 buffer (command split across DMA transfers).
+    uint32_t m_vif1PendingDirectQwc = 0u;
+    bool m_vif1PendingDirectHl = false;
+    void feedVif1Path2(const uint8_t *payload, uint32_t qwCount, bool directHl);
     std::vector<std::vector<uint8_t>> m_path3MaskedFifo;
 
     struct PendingTransfer

@@ -39,6 +39,8 @@ namespace ps2recomp
 
             config.inputPath = toml::find<std::string>(general, "input");
             config.ghidraMapPath = toml::find_or<std::string>(general, "ghidra_output", "");
+            config.dynamicSitesPath = toml::find_or<std::string>(general, "dynamic_sites", "");
+            config.hookedFunctionsPath = toml::find_or<std::string>(general, "hooked_functions", "");
             config.outputPath = toml::find<std::string>(general, "output");
             config.singleFileOutput = toml::find_or<bool>(general, "single_file_output", false);
             config.lowMemoryMode = toml::find_or<bool>(general, "low_memory_mode", config.lowMemoryMode);

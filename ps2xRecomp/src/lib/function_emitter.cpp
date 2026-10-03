@@ -202,7 +202,7 @@ namespace ps2recomp
 
                     ss << "    ctx->pc = 0x" << std::hex << inst.address << "u;\n"
                        << std::dec;
-                    const MemoryAccessHint memoryHint = resolveMemoryAccessHint(inst, constantRegisters);
+                    const MemoryAccessHint memoryHint = cg.isDynamicSite(inst.address) ? MemoryAccessHint{} : resolveMemoryAccessHint(inst, constantRegisters);
                     ss << "    " << cg.translateInstruction(inst, memoryHint);
                     if (inst.isMmio)
                     {
@@ -211,6 +211,10 @@ namespace ps2recomp
                     ss << "\n";
 
                     updateConstantRegisters(inst, constantRegisters);
+                    if (cg.isDynamicSite(inst.address))
+                    {
+                        constantRegisters.invalidate(inst.rt);
+                    }
                 }
             }
             catch (const std::exception &e)

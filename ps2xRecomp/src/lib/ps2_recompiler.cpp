@@ -1020,6 +1020,28 @@ namespace ps2recomp
                 }
             }
             m_codeGenerator->setRelocationCallNames(relocationCallNames);
+            if (!m_config.dynamicSitesPath.empty())
+            {
+                std::ifstream dyn(m_config.dynamicSitesPath);
+                std::string line;
+                while (std::getline(dyn, line))
+                {
+                    if (!line.empty() && line[0] != '#')
+                        m_codeGenerator->m_dynamicSites.insert(static_cast<uint32_t>(std::stoul(line, nullptr, 16)));
+                }
+                std::cout << "Loaded " << m_codeGenerator->m_dynamicSites.size() << " dynamic-link sites from " << m_config.dynamicSitesPath << std::endl;
+            }
+            if (!m_config.hookedFunctionsPath.empty())
+            {
+                std::ifstream hk(m_config.hookedFunctionsPath);
+                std::string line;
+                while (std::getline(hk, line))
+                {
+                    if (!line.empty() && line[0] != '#')
+                        m_codeGenerator->m_hookedFunctions.insert(static_cast<uint32_t>(std::stoul(line, nullptr, 16)));
+                }
+                std::cout << "Loaded " << m_codeGenerator->m_hookedFunctions.size() << " hooked functions" << std::endl;
+            }
             m_codeGenerator->setBootstrapInfo(m_bootstrapInfo);
             m_codeGenerator->setConfiguredJumpTables(m_config.jumpTables);
             m_codeGenerator->setEmitInstructionComments(true);

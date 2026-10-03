@@ -1,3 +1,5 @@
+#include <ostream>
+#include <cstdlib>
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_address.h"
 #include "runtime/gs/gs_frontend.h"
@@ -9,6 +11,18 @@
 #include <algorithm>
 #include <string>
 #include <vector>
+
+std::atomic<uint64_t> g_dmaKicksPerChannel[8];
+std::atomic<uint64_t> g_vif1ChainEnds[4]; // 0 end/refe, 1 irq+tie stop, 2 ret-underflow/other, 3 tag cap
+std::atomic<uint64_t> g_vif1ChainTags;
+void ps2xDumpDmaStats(std::ostream &out)
+{
+    out << "[ee-dma] kicks:";
+    for (int i = 0; i < 8; ++i) out << " ch" << i << "=" << g_dmaKicksPerChannel[i].exchange(0);
+    out << " | vif1 chain ends: end=" << g_vif1ChainEnds[0].exchange(0) << " irqStop=" << g_vif1ChainEnds[1].exchange(0)
+        << " other=" << g_vif1ChainEnds[2].exchange(0) << " tagCap=" << g_vif1ChainEnds[3].exchange(0) << " tags=" << g_vif1ChainTags.exchange(0);
+    out << "\n";
+}
 
 namespace
 {
@@ -331,6 +345,8 @@ bool PS2Memory::initialize(size_t ramSize)
     m_path3MaskedFifo.clear();
     m_vif1PendingPath2ImageQwc = 0u;
     m_vif1PendingPath2DirectHl = false;
+    m_vif1PendingDirectQwc = 0u;
+    m_vif1PendingDirectHl = false;
     resetEeTimers();
 
     try
@@ -1231,6 +1247,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 std::memset(&vif1_regs, 0, sizeof(vif1_regs));
                 m_vif1PendingPath2ImageQwc = 0u;
                 m_vif1PendingPath2DirectHl = false;
+                m_vif1PendingDirectQwc = 0u;
+                m_vif1PendingDirectHl = false;
+    m_vif1PendingDirectQwc = 0u;
+    m_vif1PendingDirectHl = false;
                 m_path3Masked = false;
                 if (wasPath3Masked)
                     flushMaskedPath3Packets();
@@ -1305,6 +1325,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             const uint32_t madr = m_ioRegisters[channelBase + 0x10];
             const uint32_t qwc = m_ioRegisters[channelBase + 0x20];
             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
+            g_dmaKicksPerChannel[((channelBase - 0x10008000u) >> 12) & 7u].fetch_add(1, std::memory_order_relaxed);
 
             if (tryProcessScratchpadDma(channelBase, value))
             {
@@ -1344,8 +1365,22 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
                     uint32_t asp = (chcr >> 4) & 0x3u;
                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
-                    const int kMaxChainTags = 4096;
+                    // Runaway guard on tags walked per kick (hardware has no cap). SotC's 3D display-list
+                    // chains use ~4510 tags per frame, so the old fixed 4096 cap dropped their tail.
+                    // PS2X_DMA_MAX_CHAIN_TAGS overrides the guard.
+                    static const int kMaxChainTags = []
+                    {
+                        const char *v = std::getenv("PS2X_DMA_MAX_CHAIN_TAGS");
+                        const long n = v ? std::strtol(v, nullptr, 0) : 0;
+                        return n > 0 ? static_cast<int>(std::min<long>(n, 1L << 24)) : (1 << 20);
+                    }();
                     std::vector<uint8_t> chainBuf;
+                    // Pre-size from the largest chain seen on this channel so multi-MB display lists
+                    // are gathered without repeated grow-and-copy (contents are unaffected).
+                    static size_t s_chainReserve[8] = {};
+                    size_t &chainReserve = s_chainReserve[((channelBase - 0x10008000u) >> 12) & 7u];
+                    if (chainReserve != 0u)
+                        chainBuf.reserve(chainReserve);
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
                     {
@@ -1516,9 +1551,19 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         if (hasPayload)
                             appendData(dataAddr, tagQwc);
                         if (irq && tieEnabled)
+                        {
                             endChain = true;
+                            if (channelBase == 0x10009000u) g_vif1ChainEnds[1].fetch_add(1);
+                        }
+                        else if (endChain && channelBase == 0x10009000u)
+                            g_vif1ChainEnds[id == 7 || id == 0 ? 0 : 2].fetch_add(1);
                         if (endChain)
                             break;
+                    }
+                    if (channelBase == 0x10009000u)
+                    {
+                        if (tagsProcessed >= kMaxChainTags) g_vif1ChainEnds[3].fetch_add(1);
+                        g_vif1ChainTags.fetch_add(static_cast<uint64_t>(tagsProcessed));
                     }
 
                     m_ioRegisters[channelBase + 0x30] = tagAddr;
@@ -1528,6 +1573,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     chcr = (chcr & 0x0000FFFFu) | (lastTagUpper << 16);
                     m_ioRegisters[channelBase + 0x00] = chcr;
 
+                    if (chainBuf.size() > chainReserve)
+                        chainReserve = chainBuf.size();
                     if (!chainBuf.empty())
                     {
                         PendingTransfer pt;

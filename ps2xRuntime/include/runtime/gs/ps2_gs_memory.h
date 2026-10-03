@@ -540,6 +540,27 @@ namespace GSMem
 
 	void InitLookupTables();
 
+	// Swizzle tables (filled by InitLookupTables).
+	extern PixelStorageTraits<C32>::PageLookupTableT PageTableC32;
+	extern PixelStorageTraits<Z32>::PageLookupTableT PageTableZ32;
+	extern PixelStorageTraits<C16>::PageLookupTableT PageTableC16;
+	extern PixelStorageTraits<C16S>::PageLookupTableT PageTableC16S;
+	extern PixelStorageTraits<Z16>::PageLookupTableT PageTableZ16;
+	extern PixelStorageTraits<Z16S>::PageLookupTableT PageTableZ16S;
+	extern PixelStorageTraits<P8>::PageLookupTableT PageTableP8;
+	extern PixelStorageTraits<P4>::PageLookupTableT PageTableP4;
+
+	// Byte address and bit shift of a pixel, identical to PixelStorageTraits<psm>::Read/Write.
+	template<PixelStorageMode psm>
+	inline u32 PixelByteAddress(const typename PixelStorageTraits<psm>::PageLookupTableT& table, u32 block, u32 bw, u32 x, u32 y, u32& shift)
+	{
+		using Traits = PixelStorageTraits<psm>;
+		const u32 pixel_addr = Traits::Address(table, block, bw, x, y);
+		const u32 bits = pixel_addr * UnpackedBitWidth(psm) + Traits::BitOffset();
+		shift = bits % 8;
+		return (bits / 8) & (MEMORY_SIZE - sizeof(typename Traits::PackedT));
+	}
+
     // Shares swizzle, VRAM wrapping, and lane extraction with the direct reads.
     u32 ReadTexture(TexturePageCache& cache, const u8* data, u32 psm, u32 bp, u32 bw, u32 x, u32 y);
 

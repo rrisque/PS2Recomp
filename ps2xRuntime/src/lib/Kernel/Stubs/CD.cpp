@@ -1,3 +1,5 @@
+#include <algorithm>
+#include <atomic>
 #include "Common.h"
 #include "CD.h"
 #include "MPEG.h"
@@ -5,6 +7,8 @@
 
 namespace ps2_stubs
 {
+    static std::atomic<uint32_t> g_cdReadsSinceSync{0};
+    static std::atomic<uint32_t> g_cdSectorsSinceSync{0};
     namespace
     {
         constexpr uint32_t kCdStreamBlocking = 1u;
@@ -206,6 +210,8 @@ namespace ps2_stubs
 
     void sceCdRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        g_cdReadsSinceSync.fetch_add(1);
+        g_cdSectorsSinceSync.fetch_add(getRegU32(ctx, 5));
         const uint32_t a0 = getRegU32(ctx, 4); // usually lbn
         const uint32_t a1 = getRegU32(ctx, 5); // usually sector count
         const uint32_t a2 = getRegU32(ctx, 6); // usually destination buffer
@@ -323,9 +329,22 @@ namespace ps2_stubs
         setReturnS32(ctx, 0);
     }
 
+    // PS2X_CD_LATENCY_VSYNC=N: a blocking sceCdSync(0) after a read parks the calling thread for N
+    // vsyncs, like a real drive, so lower-priority threads run during loads. Games can depend on that
+    // ordering (SotC: the isys thread must init before GAMECORE's main init).
     void sceCdSync(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        static const uint32_t latency = [] { const char *v = std::getenv("PS2X_CD_LATENCY_VSYNC"); return v ? static_cast<uint32_t>(std::atoi(v)) : 0u; }();
         setReturnS32(ctx, 0); // 0 = completed/not busy
+        // PS2X_CD_SECTORS_PER_VSYNC=N: additionally scale the wait by sectors read (~20 = PS2 DVD speed).
+        static const uint32_t sectorsPerVsync = [] { const char *v = std::getenv("PS2X_CD_SECTORS_PER_VSYNC"); return v ? static_cast<uint32_t>(std::atoi(v)) : 0u; }();
+        if (latency && runtime && getRegU32(ctx, 4) == 0u && g_cdReadsSinceSync.exchange(0) != 0u)
+        {
+            const uint32_t sectors = g_cdSectorsSinceSync.exchange(0);
+            uint32_t ticks = latency;
+            if (sectorsPerVsync) ticks = std::max<uint32_t>(latency, (sectors + sectorsPerVsync - 1) / sectorsPerVsync);
+            runtime->eeWaitVSyncTicks(ticks, getRegU32(ctx, 31));
+        }
     }
 
     void sceCdGetError(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

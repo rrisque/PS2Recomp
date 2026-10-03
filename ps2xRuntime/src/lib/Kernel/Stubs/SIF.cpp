@@ -310,7 +310,10 @@ namespace ps2_stubs
     {
         (void)rdram;
         const uint32_t size = getRegU32(ctx, 5);
-        setReturnU32(ctx, runtime ? runtime->allocateIopMemory(size, 64u) : 0u);
+        const uint32_t addr = runtime ? runtime->allocateIopMemory(size, 64u) : 0u;
+        std::cerr << "[sceSifAllocSysMemory] mode=" << getRegU32(ctx, 4) << " size=0x" << std::hex << size
+                  << " -> 0x" << addr << " ra=0x" << getRegU32(ctx, 31) << std::dec << std::endl;
+        setReturnU32(ctx, addr);
     }
 
     void sceSifBindRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -699,6 +702,25 @@ namespace ps2_stubs
             pending[pendingCount++] = xfer;
         }
 
+        {
+            static int logs = 0;
+            if (logs++ < 40)
+            {
+                const uint8_t *e0 = getConstMemPtr(rdram, dmatAddr);
+                Ps2SifDmaTransfer x0{};
+                if (e0) std::memcpy(&x0, e0, sizeof(x0));
+                std::cerr << "[sceSifSetDma] ok=" << ok << " count=" << count << " src=0x" << std::hex << x0.src
+                          << " dst=0x" << x0.dest << " size=0x" << x0.size << " iopRange=" << (runtime && runtime->isIopMemoryRange(x0.dest, x0.size > 0 ? x0.size : 1))
+                          << std::dec;
+                if (const uint8_t *b = getConstMemPtr(rdram, x0.src))
+                {
+                    std::cerr << " head=";
+                    for (int k = 0; k < 16; ++k) std::cerr << std::hex << (b[k] >> 4) << (b[k] & 15) << ' ';
+                    std::cerr << std::dec;
+                }
+                std::cerr << std::endl;
+            }
+        }
         if (ok)
         {
             for (uint32_t i = 0; i < pendingCount; ++i)

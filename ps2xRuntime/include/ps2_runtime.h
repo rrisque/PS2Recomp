@@ -150,6 +150,10 @@ struct alignas(16) R5900Context
 
         // Initialize VU0 registers
         vu0_q = 1.0f; // Q register usually initialized to 1.0
+        // VF0 is hardwired to (0,0,0,1) on the VU. Every context (including each new guest thread's,
+        // created via StartThread) must start with it, or VU0 macro code that uses vf0.w as the
+        // constant 1 (lengths, normalisation, matrix w) computes 0 everywhere.
+        vu0_vf[0] = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);
 
         // Reset COP0 registers
         cop0_random = 47; // Start at maximum value
@@ -394,6 +398,10 @@ public:
     const EeScheduler &eeScheduler() const;
     void postEeEvent(EeEvent event);
     bool eeCheckpointDue(uint32_t cycles = 32u) noexcept;
+    // Nested synchronous guest calls from host overrides must not be preempted mid-function
+    // (e.g. while holding a guest semaphore). While > 0, eeCheckpointDue() only accounts cycles.
+    void suppressCheckpoints(bool on) noexcept { m_checkpointSuppress += on ? 1 : -1; }
+    int m_checkpointSuppress = 0;
     [[noreturn]] void eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc);
 
     struct EeExitHandlerRegistration

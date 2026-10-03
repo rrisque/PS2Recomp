@@ -1,3 +1,6 @@
+#include <cstdio>
+#include <vector>
+#include <mutex>
 #include "ps2_runtime.h"
 #include "ps2_log.h"
 #include "ps2_stubs.h"
@@ -151,8 +154,15 @@ namespace
         return true;
     }
 
+    std::unordered_map<uint32_t, uint64_t> g_dispatchProfile; // guarded by being EE-executor only
+    std::mutex g_dispatchProfileMutex;
+
     void pushDispatchPc(uint32_t pc)
     {
+        {
+            static const bool profile = std::getenv("PS2X_THREAD_DUMP_SECS") != nullptr;
+            if (profile) { std::lock_guard<std::mutex> lk(g_dispatchProfileMutex); ++g_dispatchProfile[pc]; }
+        }
         DispatchHistory &h = g_dispatchHistory;
         h.pcs[h.next] = pc;
         h.next = (h.next + 1u) % static_cast<uint32_t>(h.pcs.size());
@@ -665,6 +675,11 @@ bool PS2Runtime::syncCoreSubsystems()
     }
 
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
+    m_gs.setInterruptHandler([this](uint32_t)
+                             {
+                                 if (m_eeScheduler)
+                                     m_eeScheduler->postEvent(EeEvent{EeEventType::GsInterrupt, 0u, 0u});
+                             });
     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
                                     { m_gs.processGIFPacket(data, size); });
     m_memory.setGifArbiter(&m_gifArbiter);
@@ -2211,6 +2226,11 @@ void PS2Runtime::postEeEvent(EeEvent event)
 
 bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
 {
+    if (m_checkpointSuppress > 0)
+    {
+        m_eeScheduler->accountCycles(cycles);
+        return false;
+    }
     return m_eeScheduler->checkpointDue(cycles);
 }
 
@@ -2469,4 +2489,34 @@ void PS2Runtime::run()
     CloseWindow();
 
     RUNTIME_LOG("[run] exiting loop");
+}
+
+
+// Prints the most frequently dispatched guest addresses since the last call, then resets the counts.
+void ps2xDumpDispatchProfile(std::ostream &out, size_t topN)
+{
+    std::vector<std::pair<uint32_t, uint64_t>> v;
+    {
+        std::lock_guard<std::mutex> lk(g_dispatchProfileMutex);
+        v.assign(g_dispatchProfile.begin(), g_dispatchProfile.end());
+        g_dispatchProfile.clear();
+    }
+    std::sort(v.begin(), v.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
+    out << "[ee-profile] top dispatch targets:";
+    for (size_t i = 0; i < v.size() && i < topN; ++i)
+        out << " 0x" << std::hex << v[i].first << std::dec << ":" << v[i].second;
+    out << std::endl;
+}
+
+// Divide-by-zero diagnostics for recompiled FPU/VU0 code (see Ps2FDivAt in ps2_runtime_macros.h).
+void Ps2NoteDivZero(uint32_t pc)
+{
+    static const bool enabled = std::getenv("PS2X_TRACE_DIVZERO") != nullptr;
+    if (!enabled)
+        return;
+    static std::mutex m;
+    static std::unordered_map<uint32_t, uint64_t> seen;
+    std::lock_guard<std::mutex> lk(m);
+    if (++seen[pc] == 1 && seen.size() <= 200)
+        std::fprintf(stderr, "[divzero] first x/0 at pc=0x%x\n", pc);
 }

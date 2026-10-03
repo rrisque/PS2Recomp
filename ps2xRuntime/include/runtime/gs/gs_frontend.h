@@ -1,6 +1,7 @@
 #ifndef PS2_GS_FRONTEND_H
 #define PS2_GS_FRONTEND_H
 
+#include <functional>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -99,6 +100,9 @@ struct GSDebugHistoryEntry
 class GS
 {
 public:
+    // Called when a GS event (CSR bit) is raised and not masked by IMR (INTC cause 0 on hardware).
+    void setInterruptHandler(std::function<void(uint32_t csrBit)> handler) { m_onInterrupt = std::move(handler); }
+    std::function<void(uint32_t)> m_onInterrupt;
     GS();
     ~GS() = default;
 
@@ -158,6 +162,7 @@ private:
                                    uint64_t trxdir,
                                    const uint8_t *data,
                                    uint32_t sizeBytes);
+    void applyMtbaUnlocked(int contextIndex);
     void vertexKick(bool drawing);
 
     void recordDebugEventUnlocked(GSDebugHistoryEntry entry);

@@ -314,6 +314,9 @@ namespace ps2_syscalls
         const auto loaded = runtime->loadIopModuleBuffer(bufferAddr, arguments.empty() ? nullptr : arguments.data(), static_cast<uint32_t>(arguments.size()));
         if (!loaded.handled || loaded.moduleId <= 0)
         {
+            std::cerr << "[sceSifLoadModuleBuffer:FAIL] buf=0x" << std::hex << bufferAddr
+                      << " tag=" << moduleTag << " handled=" << loaded.handled
+                      << " id=" << std::dec << loaded.moduleId << std::endl;
             setReturnS32(ctx, -1);
             return;
         }

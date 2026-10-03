@@ -608,3 +608,9 @@ endif()
 install(DIRECTORY include/
     DESTINATION include
 )
+
+# SOTC: optimize the runtime library (software GS rasterizer, VU1, IOP) even in -O1 dev builds;
+# the generated game code stays at the dev optimization level for fast rebuilds.
+if(TARGET ps2_runtime AND NOT MSVC)
+    target_compile_options(ps2_runtime PRIVATE -O3)
+endif()

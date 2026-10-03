@@ -929,7 +929,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
         GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
         vtx.x = static_cast<float>(x) / 16.0f;
         vtx.y = static_cast<float>(y) / 16.0f;
-        vtx.z = static_cast<float>(z);
+        vtx.z = static_cast<double>(z);
         vtx.r = m_curR;
         vtx.g = m_curG;
         vtx.b = m_curB;
@@ -966,7 +966,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
         GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
         vtx.x = static_cast<float>(x) / 16.0f;
         vtx.y = static_cast<float>(y) / 16.0f;
-        vtx.z = static_cast<float>(z);
+        vtx.z = static_cast<double>(z);
         vtx.r = m_curR;
         vtx.g = m_curG;
         vtx.b = m_curB;
@@ -1000,7 +1000,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
         GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
         vtx.x = static_cast<float>(lo & 0xFFFF) / 16.0f;
         vtx.y = static_cast<float>((lo >> 32) & 0xFFFF) / 16.0f;
-        vtx.z = static_cast<float>((hi >> 4) & 0xFFFFFF);
+        vtx.z = static_cast<double>((hi >> 4) & 0xFFFFFF);
         vtx.r = m_curR;
         vtx.g = m_curG;
         vtx.b = m_curB;
@@ -1031,7 +1031,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
         GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
         vtx.x = static_cast<float>(lo & 0xFFFF) / 16.0f;
         vtx.y = static_cast<float>((lo >> 32) & 0xFFFF) / 16.0f;
-        vtx.z = static_cast<float>(hi & 0xFFFFFFFF);
+        vtx.z = static_cast<double>(hi & 0xFFFFFFFF);
         vtx.r = m_curR;
         vtx.g = m_curG;
         vtx.b = m_curB;
@@ -1240,6 +1240,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         t.csa = static_cast<uint8_t>((value >> 56) & 0x1F);
         t.cld = static_cast<uint8_t>((value >> 61) & 0x7);
         m_backend->LoadClut(t, m_texclut);
+        applyMtbaUnlocked(ci);
         break;
     }
     case GS_REG_CLAMP_1:
@@ -1471,6 +1472,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
             lo = (lo & ~mask) | (id & mask);
             m_privRegs->siglblid = (m_privRegs->siglblid & 0xFFFFFFFF00000000ULL) | lo;
             m_privRegs->csr.fetch_or(0x1);
+            if (m_onInterrupt && !(m_privRegs->imr & (1ull << 8))) // SIGMSK
+                m_onInterrupt(0x1);
         }
         break;
     }
@@ -1482,7 +1485,11 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
             m_backend->Sync(GSSyncReason::Finish);
         }
         if (m_privRegs)
+        {
             m_privRegs->csr.fetch_or(0x2);
+            if (m_onInterrupt && !(m_privRegs->imr & (1ull << 9))) // FINISHMSK
+                m_onInterrupt(0x2);
+        }
         break;
     }
     case GS_REG_LABEL:
@@ -1522,6 +1529,50 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     }
 
     recordRegisterDebugEventUnlocked(regAddr, value);
+}
+
+void GS::applyMtbaUnlocked(int ci)
+{
+    // TEX1.MTBA: a TEX0 write (not TEX2) derives MIPTBP1 for levels 1-3. Only colour formats with
+    // 32 <= width <= 1024 (512 for 32-bit-unpacked formats) qualify. Levels are packed behind each
+    // other using the *width* for both dimensions, at least one block apart; TBW halves per level
+    // starting from width/64. (GSdx GSState::GIFRegHandlerTEX0.)
+    const auto &t = m_ctx[ci].tex0;
+    if (((m_ctx[ci].tex1 >> 9) & 1u) == 0u)
+        return;
+    uint32_t bpp = 32u;
+    switch (t.psm)
+    {
+    case GS_PSM_CT16:
+    case GS_PSM_CT16S:
+        bpp = 16u;
+        break;
+    case GS_PSM_T8:
+        bpp = 8u;
+        break;
+    case GS_PSM_T4:
+        bpp = 4u;
+        break;
+    default:
+        bpp = 32u; // CT32, CT24 and the T8H/T4HL/T4HH planes live in 32-bit pixels
+        break;
+    }
+    const uint32_t maxTw = bpp < 32u ? 10u : 9u;
+    if (t.tw < 5u || t.tw > maxTw || (t.psm & 0x30u) == 0x30u)
+        return;
+
+    uint32_t bp = t.tbp0;
+    uint32_t bw = std::max<uint32_t>(1u, (1u << t.tw) >> 6);
+    uint32_t size = ((1u << t.tw) * (1u << t.tw) * (bpp >> 2)) >> 9;
+    uint64_t mip = 0u;
+    for (uint32_t level = 0; level < 3u; ++level)
+    {
+        bp += size;
+        bw = std::max<uint32_t>(bw >> 1, 1u);
+        size = std::max<uint32_t>(size >> 2, 1u);
+        mip |= (static_cast<uint64_t>(bp & 0x3FFFu) | (static_cast<uint64_t>(bw & 0x3Fu) << 14)) << (level * 20u);
+    }
+    m_ctx[ci].miptbp1 = (m_ctx[ci].miptbp1 & ~0x0FFFFFFFFFFFFFFFull) | mip;
 }
 
 void GS::vertexKick(bool drawing)
@@ -1697,7 +1748,10 @@ GSPrimitiveBatch GS::buildDrawBatch(int vertexCount) const
     const uint64_t tex1 = batch.state.context.tex1;
     const uint8_t mmag = static_cast<uint8_t>((tex1 >> 5u) & 0x1u);
     const uint8_t mmin = static_cast<uint8_t>((tex1 >> 6u) & 0x7u);
-    batch.state.linearFilter = mmag != 0u || mmin == 1u || (mmin & 0x4u) != 0u;
+    // With MXL=0 the GS ignores MMIN and always filters with MMAG. With MXL>0 the backend
+    // picks MMAG/MMIN per pixel from the LOD; this flag is only the MXL=0 answer then.
+    const uint8_t mxl = static_cast<uint8_t>((tex1 >> 2u) & 0x7u);
+    batch.state.linearFilter = mxl == 0u ? (mmag != 0u) : (mmag != 0u || mmin == 1u || (mmin & 0x4u) != 0u);
     return batch;
 }
 
